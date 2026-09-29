@@ -1,0 +1,102 @@
+# =============================================================================
+# params.yaml — Run Parameters
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Pipeline mode
+# -----------------------------------------------------------------------------
+#
+#   sv_analysis
+#       → batch_microhomology_search() from sv_analysis.py
+#         Pileup-based left+right consensus, MMEJ microhomology search,
+#         pileup PNG plots.
+#
+#   sv_analysis_with_sc_adjustment
+#       → batch_microhomology_search() from sv_analysis_with_sc_adjustment.py
+#         Same as sv_analysis, but breakpoint pairs that share >sa_share_threshold
+#         of their SA-supporting reads are merged (Union-Find).
+#         The WIDEST span in the merged cluster sets refined_left/refined_right;
+#         all narrower pairs are re-anchored to that wider soft-clip span before
+#         consensus building and MH search.  Intended for noisy WGS long-read
+#         supplementary alignments where soft-clip tails can still share high
+#         identity with reference.
+#
+#   sv_rearrangement_path
+#       → batch_rearrangement_path_search() from sv_rearrangement_path.py
+#         Clip-first, PDV-aware, minimap2-based k-mer seed-and-extend
+#         reference-path decomposition.  Produces per-pair path CSVs and
+#         two-panel figures.
+
+# mode: "sv_analysis"
+mode: "sv_analysis_with_sc_adjustment"
+# mode: "sv_rearrangement_path"
+
+# -----------------------------------------------------------------------------
+# Input files
+# -----------------------------------------------------------------------------
+# bam_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/ONT_PacBio_CNV_calling/automated_precise_breakpoint_finding/test_data_for_breakpoint_pipeline/HG002_pacbio_data/region_chr11_94197577_94278990.bam"
+bam_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/ONT_PacBio_CNV_calling/automated_precise_breakpoint_finding/test_data_for_breakpoint_pipeline/HG002_pacbio_data/HG002_PacBio-HiFi-Revio_48x_refseq_only.bam"
+# bam_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/ONT_PacBio_CNV_calling/automated_precise_breakpoint_finding/test_data_for_breakpoint_pipeline/HG002_ont_data/calls.sorted.bam"
+# bam_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/ONT_PacBio_CNV_calling/automated_precise_breakpoint_finding/test_data_for_breakpoint_pipeline/HG002_pacbio_data/HG002_PacBio-HiFi-Revio_20231031_48x_GRCh38-GIABv3.bam"
+# bam_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/demultiplex_pb/workflow_HiFiTargetEnrichment/batches/target_hifit/bc1008/realigned_minimap2/bc1008.minimap2.GRCh38.bam"
+
+ref_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/genomes/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta.gz"
+# ref_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/genomes/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna"
+
+# -----------------------------------------------------------------------------
+# Output directory
+# -----------------------------------------------------------------------------
+# Leave blank to auto-derive from BAM filename:
+#   results/<bam_stem>/<mode>/
+save_dir: ""
+
+# ── Shared settings (used by ALL modes) ──────────────────────────────────────
+min_clip_len: 50        # minimum soft-clip length to consider a clip event
+min_support: 5          # minimum reads at a clip cluster to report it
+min_support_frac: 0.05  # also require support >= this fraction × local depth
+cluster_dist: 10        # bp radius for merging nearby clip events
+top_n: 20               # keep only the top-N clip positions by support
+min_mapq: 60            # minimum MAPQ for primary and SA alignments
+max_dist: 500000        # ignore candidate pairs spanning > this many bp
+                        # (set to null or leave blank for unlimited)
+pair_strategy: "split_read_bridge"
+# Choices:
+#   split_read_bridge  – score all candidate pairs by bridging-read count (recommended)
+#   greedy_rank        – pair by support-rank order (fast fallback)
+#   proximity          – match nearest right-clip to each left-clip
+#   consecutive        – pair adjacent rows in the clip table
+
+# ── sv_analysis / sv_analysis_with_sc_adjustment settings ────────────────────
+min_mh: 2                       # minimum microhomology length to report
+show_pileup: false              # print HTML pileup to notebook / stdout
+show_homozygous_variants: false # report background homozygous SNPs in pileup windows
+
+# ── sv_analysis only ──────────────────────────────────────
+# flank: 600                      # bp to extend from each breakpoint for consensus
+
+# ── sv_analysis_with_sc_adjustment only ──────────────────────────────────────
+# These control Stage 4: cluster_softclip_pairs (Union-Find).
+flank: None   # for sv_analysis_with_sc_adjustment only
+sa_share_threshold: 0.50  # merge two pairs when shared SA reads / min(|A|,|B|) > this
+bridge_tol: 200           # bp search tolerance when collecting SA bridging reads
+
+# ── sv_rearrangement_path-only settings ──────────────────────────────────────
+min_segment_len: 10         # minimum aligned bp to keep a reference block on one read
+junction_tol: 50            # bp bin size for junction-key Jaccard comparison
+ref_bin_tol: 100            # bp tolerance for merging nearby ref blocks across reads
+min_block_support: 2        # minimum reads to keep a reference block node in the graph
+fetch_padding: 500000       # bp padding each side when re-fetching primary reads
+landing_tol: 200            # bp tolerance for SA landing-position matching
+max_aln_span: 1000000       # maximum reference span for a single minimap2 alignment
+minimap2_preset: "map-hifi" # minimap2 preset: map-hifi | map-ont | map-pb
+min_identity: 0.90          # minimum alignment identity to keep a segment
+match_score: 2              # minimap2 match score
+mismatch_penalty: 8         # minimap2 mismatch penalty
+gap_open: 4                 # minimap2 gap-open penalty (first scheme)
+gap_extend: 2               # minimap2 gap-extend penalty (first scheme)
+gap_open2: 24               # minimap2 gap-open penalty (second scheme)
+gap_extend2: 1              # minimap2 gap-extend penalty (second scheme)
+pdv_min_split_vaf: 0.20     # minimum split-read VAF to flag a PDV position
+pdv_min_enrichment: 3.0     # minimum fold-enrichment over background to flag PDV
+background_hom_vaf: 0.95    # AF threshold to call a position homozygous background
+min_graph_segment_support: 10  # minimum reads to keep a segment node in the graph
