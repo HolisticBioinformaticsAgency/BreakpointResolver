@@ -1,0 +1,159 @@
+# =============================================================================
+# params_batch.yaml — Batch Run Parameters
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Pipeline mode
+# -----------------------------------------------------------------------------
+#
+#   sv_analysis
+#       → batch_microhomology_search() from sv_analysis.py
+#         Pileup-based left+right consensus, MMEJ microhomology search,
+#         pileup PNG plots.
+#
+#   sv_analysis_with_sc_adjustment
+#       → batch_microhomology_search() from sv_analysis_with_sc_adjustment.py
+#         Same as sv_analysis, but breakpoint pairs that share >sa_share_threshold
+#         of their SA-supporting reads are merged (Union-Find).
+#         The WIDEST span in the merged cluster sets refined_left/refined_right;
+#         all narrower pairs are re-anchored to that wider soft-clip span before
+#         consensus building and MH search.  Intended for noisy WGS long-read
+#         supplementary alignments where soft-clip tails can still share high
+#         identity with reference.
+#
+#   sv_rearrangement_path
+#       → batch_rearrangement_path_search() from sv_rearrangement_path.py
+#         Clip-first, PDV-aware, minimap2-based k-mer seed-and-extend
+#         reference-path decomposition.  Produces per-pair path CSVs and
+#         two-panel figures.
+#
+#   sv_analysis_junction_rearr
+#       → run_pipeline() from sv_analysis_junction_rearr.py
+#         Standalone SNP-anchored rearrangement graph + interactive HTML arc
+#         diagram per cluster. IMPORTANT: this mode independently rediscovers
+#         and reclusters breakpoint candidates. Use it for arc-only exploration,
+#         not when MH and arcs need to describe exactly the same clusters.
+#
+#   sv_analysis_sc_adjustment_arc
+#       → batch_microhomology_arc_search() from sv_analysis_sc_adjustment_arc.py
+#         INTEGRATED MODE. The SC-adjustment pipeline's exact clusters
+#         (find_major_clip_pairs → cluster_clip_pairs_by_reads) are the one
+#         source of truth. For EVERY retained cluster, it produces BOTH:
+#           1. the existing consensus / pileup / MMEJ microhomology outputs;
+#           2. an interactive SNP-node rearrangement arc-diagram HTML.
+#         This is the recommended mode for your current comparison, because
+#         the MH figure and arc diagram share the same cluster coordinates.
+#         Set arc_max_clusters: null to process ALL clusters (default), or an
+#         integer such as 1 only for a short debugging run. Requires networkx
+#         in the `ont` conda environment:
+#           python -c "import networkx"
+#
+
+
+# mode: "sv_analysis"
+# mode: "sv_analysis_with_sc_adjustment"
+# mode: "sv_rearrangement_path"
+# mode: "sv_analysis_junction_rearr"
+mode: "sv_analysis_with_sc_adjustment"
+
+
+# -----------------------------------------------------------------------------
+# Reference genome
+# -----------------------------------------------------------------------------
+# ref_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/genomes/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta.gz"
+ref_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/genomes/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna"
+
+
+# -----------------------------------------------------------------------------
+# Output directory
+# -----------------------------------------------------------------------------
+# Leave blank ("") to auto-derive from BAM filename:
+#   results/<barcode_platform>/<bam_stem>/<mode>/
+save_dir: ""
+
+
+# ── Shared discovery settings ─────────────────────────────────────────────────
+# Used by sv_analysis / sv_analysis_with_sc_adjustment /
+# sv_rearrangement_path / sv_analysis_sc_adjustment_arc.
+#
+# In the INTEGRATED mode, these define the ONE SC-adjustment cluster set that
+# receives both MH and arc output.
+min_clip_len: 50        # minimum soft-clip length to consider a clip event
+min_support: 5          # minimum reads at a clip cluster/pair to report it
+min_support_frac: 0.05  # also require support >= this fraction × local depth
+cluster_dist: 10        # bp radius for merging nearby clip events
+top_n: 20               # keep only the top-N clip pairs by support
+min_mapq: 60            # minimum MAPQ for primary and SA alignments
+max_dist: 500000        # ignore candidate pairs spanning > this many bp
+                        # (set to null for unlimited)
+pair_strategy: "split_read_bridge"
+# Choices:
+#   split_read_bridge  – score all candidate pairs by bridging-read count (recommended)
+#   greedy_rank        – pair by support-rank order (fast fallback)
+#   proximity          – match nearest right-clip to each left-clip
+#   consecutive        – pair adjacent rows in the clip table
+
+
+# ── sv_analysis / sv_analysis_with_sc_adjustment / integrated MH settings ────
+min_mh: 2                       # minimum microhomology length to report
+show_pileup: false              # print HTML pileup to notebook / stdout
+show_homozygous_variants: false # report background homozygous SNPs in pileup windows
+
+
+# ── sv_analysis only ─────────────────────────────────────────────────────────
+# flank: 600                    # bp to extend from each breakpoint for consensus
+#                               # (comment out or set to null for auto-estimate
+#                               #  from primary alignment lengths)
+
+
+# ── sv_analysis_with_sc_adjustment / integrated mode only ────────────────────
+# flank: null = auto-estimate from primary alignment lengths
+flank: null
+sa_share_threshold: 0.50  # legacy original SC-adjustment parameter; retained
+                           # for sv_analysis_with_sc_adjustment compatibility
+bridge_tol: 200           # bp tolerance for SA bridging/read fetches
+
+
+# ── sv_rearrangement_path only ───────────────────────────────────────────────
+min_segment_len: 10         # minimum aligned bp to keep a reference block on one read
+junction_tol: 50            # bp bin size for junction-key Jaccard comparison
+ref_bin_tol: 100            # bp tolerance for merging nearby ref blocks across reads
+min_block_support: 2        # minimum reads to keep a reference block node in the graph
+fetch_padding: 500000       # bp padding each side when re-fetching primary reads
+landing_tol: 200            # bp tolerance for SA landing-position matching
+max_aln_span: 1000000       # maximum reference span for a single minimap2 alignment
+minimap2_preset: "map-hifi" # minimap2 preset: map-hifi | map-ont | map-pb
+min_identity: 0.90          # minimum alignment identity to keep a segment
+match_score: 2              # minimap2 match score
+mismatch_penalty: 8         # minimap2 mismatch penalty
+gap_open: 4                 # minimap2 gap-open penalty (first scheme)
+gap_extend: 2               # minimap2 gap-extend penalty (first scheme)
+gap_open2: 24               # minimap2 gap-open penalty (second scheme)
+gap_extend2: 1              # minimap2 gap-extend penalty (second scheme)
+pdv_min_split_vaf: 0.20     # minimum split-read VAF to flag a PDV position
+pdv_min_enrichment: 3.0     # minimum fold-enrichment over background to flag PDV
+background_hom_vaf: 0.95    # AF threshold to call a position homozygous background
+min_graph_segment_support: 10  # minimum reads to keep a segment node in the graph
+
+
+# ── Arc graph settings ───────────────────────────────────────────────────────
+# Used by sv_analysis_junction_rearr and sv_analysis_sc_adjustment_arc.
+# In the integrated mode, EVERY SC-adjustment cluster gets an arc diagram when
+# arc_max_clusters is null; this does NOT rerun independent arc breakpoint
+# discovery/clustering.
+arc_padding: 500                    # bp padding for extracting split reads around
+                                     # the existing SC-adjustment cluster span
+arc_min_perfect_run: 10             # minimum perfect run (bp) before emitting
+                                     # a SNP mismatch node
+arc_min_non_split_support: 3        # germline filter: non-split-read alt count
+arc_min_non_split_frac: 0.1         # germline filter: non-split-read alt fraction
+arc_supp_mapq_min: 0                # minimum MAPQ for supplementary records
+arc_min_node_support: 2             # prune graph nodes with lower read support
+arc_context_flank: 50               # bp flank per side for context-copy scan
+arc_context_min_identity: 1.0       # 1.0=exact context copies only; set e.g. 0.95
+                                     # to include diverged segmental duplications
+arc_context_search_revcomp: true    # include reverse-complement context copies
+arc_max_clusters: null              # null = EVERY SC-adjustment cluster receives
+                                     # BOTH MH and arc outputs. Set integer only
+                                     # for a small debug run (e.g. 1).
