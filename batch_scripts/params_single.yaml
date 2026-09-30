@@ -51,6 +51,7 @@ ref_path: "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/genomes/GR
 save_dir: ""
 
 # ── Shared settings (used by ALL modes) ──────────────────────────────────────
+use_scan_cache: true    # reuse cached major clip-pairs table (Stages A-D); cache: batch_scripts/cache_dir/scan_cache
 min_clip_len: 50        # minimum soft-clip length to consider a clip event
 min_support: 5          # minimum reads at a clip cluster to report it
 min_support_frac: 0.05  # also require support >= this fraction × local depth
