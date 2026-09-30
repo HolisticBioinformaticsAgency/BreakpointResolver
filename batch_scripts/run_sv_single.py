@@ -135,6 +135,10 @@ spec = importlib.util.spec_from_file_location(mode, module_file)
 sv = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sv)
 
+# Disk cache for BAM scans (only sv_analysis_with_sc_adjustment has one)
+if hasattr(sv, "USE_SCAN_CACHE"):
+    sv.USE_SCAN_CACHE = _bool("use_scan_cache", True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Print run banner
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,6 +150,8 @@ print(f"  BAM         : {bam_path}")
 print(f"  Ref         : {ref_path}")
 print(f"  Save dir    : {save_dir}")
 print(f"  Params file : {params_file}")
+if hasattr(sv, "USE_SCAN_CACHE"):
+    print(f"  Scan cache  : {sv.SCAN_CACHE_DIR if sv.USE_SCAN_CACHE else 'off'}")
 print("-" * W)
 
 # Shared

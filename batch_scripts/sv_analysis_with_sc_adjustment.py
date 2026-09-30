@@ -12,8 +12,48 @@ from IPython.display import display, Image, HTML
 from collections import defaultdict
 from statistics import median
 import os
+import inspect
+import functools
+from joblib import Memory
 
 CLIP_OPS = {4, 5}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Major clip-pairs cache (joblib)
+# ─────────────────────────────────────────────────────────────────────────────
+# find_major_clip_pairs() (Stages A-D, the genome-wide BAM scan) is cached on
+# disk so the downstream breakpoint / MH logic can be re-run without re-scanning.
+# Cache key = every argument to find_major_clip_pairs + the BAM's real path,
+# size and mtime + the function's source code.  Set USE_SCAN_CACHE = False to
+# bypass; delete SCAN_CACHE_DIR to clear.
+SCAN_CACHE_DIR = (
+    "/fs04/scratch2/vh83/projects/temp_dnascreen_copy/dnascreen/ONT_PacBio_CNV_calling/"
+    "automated_precise_breakpoint_finding/batch_scripts/cache_dir/scan_cache"
+)
+USE_SCAN_CACHE = True
+
+def _cached_clip_pairs_call(bam_fp, fn_src, bam_path, *args, **kwargs):
+    """Cached body; *bam_fp* and *fn_src* are only there to be part of the cache key."""
+    return find_major_clip_pairs(bam_path, *args, **kwargs)
+
+@functools.lru_cache(maxsize=None)
+def _clip_pairs_memory(cache_dir):
+    return Memory(cache_dir, verbose=0).cache(_cached_clip_pairs_call)
+
+def cached_find_major_clip_pairs(bam_path, *args, **kwargs):
+    """find_major_clip_pairs() through the joblib disk cache (see SCAN_CACHE_DIR)."""
+    if not USE_SCAN_CACHE:
+        return find_major_clip_pairs(bam_path, *args, **kwargs)
+    bam_path = os.path.realpath(bam_path)
+    st = os.stat(bam_path)
+    bam_fp = (st.st_size, st.st_mtime_ns)
+    fn_src = inspect.getsource(find_major_clip_pairs)
+    call = _clip_pairs_memory(SCAN_CACHE_DIR)
+    hit = call.check_call_in_cache(bam_fp, fn_src, bam_path, *args, **kwargs)
+    print(f"  [scan-cache] {'HIT — loading cached major clip pairs' if hit else 'MISS — scanning BAM'}"
+          f"  ({SCAN_CACHE_DIR})", flush=True)
+    return call(bam_fp, fn_src, bam_path, *args, **kwargs)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
@@ -23,6 +63,34 @@ def get_ref_chroms(ref_path):
     """Return the set of contig names present in the FASTA reference."""
     with pysam.FastaFile(ref_path) as fa:
         return set(fa.references)
+
+
+PRIMARY_CHROMS = {f"chr{c}" for c in [*range(1, 23), "X", "Y"]}
+
+
+def _filter_pairs_by_contig(pairs_df, ref_path, edge_buffer, allowed_chroms=None):
+    """Drop pairs on non-primary contigs (chrM, chrEBV, chrUn_*, decoys) and pairs
+    whose breakpoints fall within *edge_buffer* bp of either contig end.
+
+    Circular contigs (chrM, chrEBV) produce origin-spanning split reads that
+    look like whole-contig duplications at position 0/1 and the contig end.
+    """
+    if pairs_df.empty:
+        return pairs_df
+    with pysam.FastaFile(ref_path) as fa:
+        lengths = dict(zip(fa.references, fa.lengths))
+    if allowed_chroms is None:
+        allowed_chroms = PRIMARY_CHROMS
+    contig_len = pairs_df["chrom"].map(lengths)
+    keep = (
+        pairs_df["chrom"].isin(allowed_chroms)
+        & (pairs_df["pos_left"] >= edge_buffer)
+        & (pairs_df["pos_right"] <= contig_len - edge_buffer)
+    )
+    for r in pairs_df[~keep].itertuples():
+        print(f"  [contig-filter] drop {r.chrom}:{r.pos_left}-{r.pos_right} support={r.support}")
+    print(f"  [contig-filter] edge_buffer={edge_buffer}  kept {int(keep.sum())}/{len(pairs_df)} pair(s)")
+    return pairs_df[keep].reset_index(drop=True)
 
 
 
@@ -2310,6 +2378,14 @@ def analyze_sv_cluster(
     else:
         print(f"  [flank] Using user-supplied flank={flank}")
 
+    # Consensus windows must fit inside the contig; skip clusters too close to either end.
+    with pysam.FastaFile(ref_path) as _fa:
+        contig_len = _fa.get_reference_length(chrom) if chrom in _fa.references else None
+    if contig_len is not None and (refined_left < flank or refined_right > contig_len - flank):
+        print(f"[{pair_label}] breakpoint within flank={flank} bp of {chrom} end "
+              f"(len={contig_len}) — skipping.")
+        return None
+
     # SV type detection
     tol = max(50, padding // 10)
     left_clips_at_left_bp, right_clips_at_left_bp = 0, 0
@@ -2438,6 +2514,9 @@ def batch_microhomology_search(
     # ── sc_adjustment version ─────────────────────────────────────────────
     sa_share_threshold=0.50,    # kept for legacy; not used by fast path
     bridge_tol=200,             # SA-bridge search tolerance (bp)
+    # ── contig filtering ──────────────────────────────────────────────────
+    edge_buffer=None,           # min bp from either contig end; None -> flank (or 600)
+    allowed_chroms=None,        # set of contigs to keep; None -> chr1-22, X, Y
 ):
     """
     Batch MMEJ microhomology search with soft-clip pair clustering.
@@ -2491,7 +2570,8 @@ def batch_microhomology_search(
         # ── Stages A-D: single-pass pair discovery ────────────────────────────────
         _banner("STAGES A-D", "Single-pass clip-pair discovery")
         t0 = time.time()
-        pairs_df = find_major_clip_pairs(
+        # save_dir is left out of the cache key; the CSV is written below instead.
+        pairs_df = cached_find_major_clip_pairs(
             bam_path, ref_path,
             chrom            = None,
             min_clip_len     = min_clip_len,
@@ -2501,9 +2581,19 @@ def batch_microhomology_search(
             top_n            = top_n,
             min_mapq         = min_mapq,
             max_dist         = max_dist,
-            save_dir         = save_dir,
+            save_dir         = None,
         )
+        if not pairs_df.empty:
+            out = os.path.join(save_dir, f"major_clip_pairs_{bam_name}.csv")
+            pairs_df.to_csv(out, index=False)
+            print(f"          Saved: {out}", flush=True)
         print(f"\n  Stages A-D elapsed: {time.time()-t0:.1f}s", flush=True)
+
+        pairs_df = _filter_pairs_by_contig(
+            pairs_df, ref_path,
+            edge_buffer    = edge_buffer if edge_buffer is not None else (flank or 600),
+            allowed_chroms = allowed_chroms,
+        )
 
         if pairs_df.empty:
             print("  No clip pairs found. Exiting.")
