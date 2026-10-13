@@ -16,7 +16,8 @@ __pycache__/
 *.out
 *.err
 *.csv
-*.html*.pyc
+*.html
+*.pyc
 *.png
 
 # Alignment / sequence data
@@ -34,3 +35,5 @@ __pycache__/
 
 # Sample ID mapping (contains DNS IDs) - keep local only
 batch_scripts/ont_pacbio_batch_scripts/barcode_sample_ids.tsv
+*sample_ids*.tsv
+*DNS[0-9]*
