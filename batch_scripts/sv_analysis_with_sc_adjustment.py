@@ -68,6 +68,142 @@ def get_ref_chroms(ref_path):
 PRIMARY_CHROMS = {f"chr{c}" for c in [*range(1, 23), "X", "Y"]}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Coordinate reporting
+# ─────────────────────────────────────────────────────────────────────────────
+# All computation is 0-based (pysam).  Every coordinate written to a CSV, PNG or
+# log line is 1-based:
+#   * breakpoint pairs (pos_left/pos_right, refined_left/refined_right) are 0-based
+#     half-open segment bounds [L, R) -> reported as 1-based inclusive L+1 .. R,
+#     i.e. the first and last base of the deleted / duplicated segment;
+#   * single-base positions (MH start/end, both inclusive) -> +1.
+
+def _seg_1b(left, right):
+    """1-based inclusive (first, last) base of a 0-based half-open segment [left, right)."""
+    return left + 1, right
+
+
+def _pos_1b(pos):
+    """1-based position of a 0-based base position (None passes through)."""
+    return None if pos is None else pos + 1
+
+
+def _pairs_1b(df):
+    """Copy of a clip-pairs table with pos_left/pos_right as 1-based inclusive bounds."""
+    out = df.copy()
+    if "pos_left" in out.columns:
+        out["pos_left"] = out["pos_left"] + 1
+    return out
+
+
+def _split_arm_overlap(read, sa_entry):
+    """Query overlap (bp) between a primary alignment and one SA arm, for a
+    deletion-type split (same strand; the left arm is right-clipped, the right
+    arm is left-clipped).  Positive = bases claimed by both arms (homology),
+    negative = unaligned bases between the arms.  None for any other layout.
+
+    CIGARs are in reference orientation for both arms, so leading-clip offsets
+    are directly comparable when the arms share a strand.
+    """
+    fields = sa_entry.split(",")
+    if len(fields) < 4:
+        return None
+    sa_rev = fields[2] == "-"
+    if sa_rev != read.is_reverse:
+        return None
+    sa_ops = [(int(n), op) for n, op in re.findall(r"(\d+)([MIDNSHP=X])", fields[3])]
+    if not sa_ops or not read.cigartuples:
+        return None
+    sa_start = int(fields[1]) - 1  # SAM SA POS is 1-based
+    sa_lead  = sa_ops[0][0] if sa_ops[0][1] in ("S", "H") else 0
+    sa_trail = sa_ops[-1][0] if sa_ops[-1][1] in ("S", "H") else 0
+    sa_total = sum(n for n, op in sa_ops if op in ("M", "I", "S", "H", "=", "X"))
+    sa_q     = (sa_lead, sa_total - sa_trail)
+
+    c = read.cigartuples
+    p_lead  = c[0][1]  if c[0][0]  in CLIP_OPS else 0
+    p_trail = c[-1][1] if c[-1][0] in CLIP_OPS else 0
+    p_total = sum(n for op, n in c if op in (0, 1, 4, 5, 7, 8))
+    p_q     = (p_lead, p_total - p_trail)
+
+    # Deletion layout: the left arm's dominant clip is on its right, the right arm's
+    # on its left (same rule as the Stage A clip-position call).
+    p_right_clipped  = p_trail >= p_lead
+    sa_right_clipped = sa_trail >= sa_lead
+    if read.reference_start <= sa_start:
+        if not (p_right_clipped and not sa_right_clipped):
+            return None
+        left_q, right_q = p_q, sa_q
+    else:
+        if not (sa_right_clipped and not p_right_clipped):
+            return None
+        left_q, right_q = sa_q, p_q
+    return left_q[1] - right_q[0]
+
+
+def _anchored_projection(query, ref):
+    """Align *query* to *ref* with query[0] anchored at ref[0], spanning all of *ref*
+    and leaving the query's far end free (banded edit distance).  Returns a list of
+    len(ref) entries: the query base aligned to each ref position, or '-' where the
+    query has a deletion.
+    """
+    n, m = len(ref), len(query)
+    if n == 0:
+        return []
+    band = max(10, n // 20)
+    INF = float("inf")
+    cost = [[INF] * (m + 1) for _ in range(n + 1)]
+    move = [[0] * (m + 1) for _ in range(n + 1)]  # 1 diag, 2 up (ref only), 3 left (query only)
+    cost[0][0] = 0
+    for j in range(1, min(m, band) + 1):
+        cost[0][j], move[0][j] = j, 3
+    for i in range(1, n + 1):
+        lo, hi = max(0, i - band), min(m, i + band)
+        for j in range(lo, hi + 1):
+            best, mv = cost[i - 1][j] + 1, 2
+            if j > 0:
+                c = cost[i - 1][j - 1] + (ref[i - 1] != query[j - 1])
+                if c < best:
+                    best, mv = c, 1
+                c = cost[i][j - 1] + 1
+                if c < best:
+                    best, mv = c, 3
+            cost[i][j], move[i][j] = best, mv
+    j = min(range(m + 1), key=lambda k: cost[n][k])
+    out = ["-"] * n
+    i = n
+    while i > 0:
+        mv = move[i][j]
+        if mv == 1:
+            out[i - 1] = query[j - 1]
+            i, j = i - 1, j - 1
+        elif mv == 2:
+            i -= 1
+        else:
+            j -= 1
+    return out
+
+
+def _large_deletions(read, min_del_len):
+    """Return [(del_start, del_end, query_idx)] for every CIGAR D >= *min_del_len* in *read*.
+
+    del_start/del_end are 0-based half-open reference coordinates of the deleted
+    segment; query_idx is the query index of the first base after the deletion.
+    """
+    out = []
+    if not read.cigartuples:
+        return out
+    ref_cursor, q_cursor = read.reference_start, 0
+    for op, length in read.cigartuples:
+        if op == 2 and length >= min_del_len:
+            out.append((ref_cursor, ref_cursor + length, q_cursor))
+        if op in (0, 2, 3, 7, 8):
+            ref_cursor += length
+        if op in (0, 1, 4, 7, 8):
+            q_cursor += length
+    return out
+
+
 def _filter_pairs_by_contig(pairs_df, ref_path, edge_buffer, allowed_chroms=None):
     """Drop pairs on non-primary contigs (chrM, chrEBV, chrUn_*, decoys) and pairs
     whose breakpoints fall within *edge_buffer* bp of either contig end.
@@ -88,7 +224,7 @@ def _filter_pairs_by_contig(pairs_df, ref_path, edge_buffer, allowed_chroms=None
         & (pairs_df["pos_right"] <= contig_len - edge_buffer)
     )
     for r in pairs_df[~keep].itertuples():
-        print(f"  [contig-filter] drop {r.chrom}:{r.pos_left}-{r.pos_right} support={r.support}")
+        print(f"  [contig-filter] drop {r.chrom}:{r.pos_left + 1}-{r.pos_right} support={r.support}")
     print(f"  [contig-filter] edge_buffer={edge_buffer}  kept {int(keep.sum())}/{len(pairs_df)} pair(s)")
     return pairs_df[keep].reset_index(drop=True)
 
@@ -142,7 +278,7 @@ def extract_split_reads(bam_path, chrom, start_search, end_search, padding):
             fields = entry.split(",")
             if len(fields) < 4:
                 continue
-            sa_chrom, sa_pos = fields[0], int(fields[1])
+            sa_chrom, sa_pos = fields[0], int(fields[1]) - 1  # SAM SA POS is 1-based
             if sa_chrom == chrom and (
                 abs(sa_pos - start_search) < padding
                 or abs(sa_pos - end_search) < padding
@@ -236,7 +372,7 @@ def find_major_clip_positions(
                 if len(fields) < 6:
                     continue
                 sa_chr = fields[0]
-                sa_pos = int(fields[1])
+                sa_pos = int(fields[1]) - 1  # SAM SA POS is 1-based
                 sa_cigar = fields[3]
                 sa_mapq = int(fields[4])
                 if sa_mapq < min_mapq:
@@ -363,7 +499,7 @@ def count_bridging_reads(bam_path, chrom, pos_a, pos_b, tol=200, min_mapq=0):
             fields = entry.split(",")
             if len(fields) < 4 or fields[0] != chrom:
                 continue
-            sa_pos = int(fields[1])
+            sa_pos = int(fields[1]) - 1  # SAM SA POS is 1-based
             sa_cigar = fields[3]
             ops = re.findall(r"(\d+)([MIDNSHP=X])", sa_cigar)
             if not ops:
@@ -414,7 +550,7 @@ def _reads_supporting_pair(bam_path, chrom, pos_a, pos_b, tol=200, min_mapq=0):
             fields = entry.split(",")
             if len(fields) < 4 or fields[0] != chrom:
                 continue
-            sa_pos = int(fields[1])
+            sa_pos = int(fields[1]) - 1  # SAM SA POS is 1-based
             sa_cigar = fields[3]
             ops = re.findall(r"(\d+)([MIDNSHP=X])", sa_cigar)
             if not ops:
@@ -668,6 +804,8 @@ def find_major_clip_pairs(
     min_mapq=60,
     max_dist=None,
     save_dir=None,
+    min_del_len=50,
+    del_match_tol=20,
 ):
     """Single-pass discovery of soft-clip *pairs* directly from SA reads.
 
@@ -729,7 +867,7 @@ def find_major_clip_pairs(
         if len(fields) < 5:
             return None
         sa_chrom = fields[0]
-        sa_pos   = int(fields[1])
+        sa_pos   = int(fields[1]) - 1  # SAM SA POS is 1-based
         sa_cigar = fields[3]
         try:
             sa_mapq = int(fields[4])
@@ -756,6 +894,9 @@ def find_major_clip_pairs(
 
     pos_lists  = defaultdict(list)
     raw_pairs  = []
+    # In-CIGAR deletions (chrom -> [(del_start, del_end)]); added to the support of
+    # split-read pairs describing the same event in Stage D.
+    cigar_dels = defaultdict(list)
 
     n_primary  = 0
     n_sa_pass  = 0
@@ -790,6 +931,10 @@ def find_major_clip_pairs(
 
             n_primary += 1
 
+            if min_del_len and read.mapping_quality >= min_mapq:
+                for d_start, d_end, _ in _large_deletions(read, min_del_len):
+                    cigar_dels[read.reference_name].append((d_start, d_end))
+
             if not read.has_tag("SA"):
                 continue
             if read.mapping_quality < min_mapq:
@@ -821,18 +966,21 @@ def find_major_clip_pairs(
                 if sa_mapq > best_sa_mapq:
                     best_sa_mapq = sa_mapq
                     best_sa = (sa_chrom, sa_pos, sa_clip_len, sa_mapq)
+                    best_sa_entry = entry
 
             if best_sa is None:
                 continue
 
             sa_chrom, sa_pos, sa_clip_len, sa_mapq = best_sa
             n_clip_pass += 1
+            arm_overlap = _split_arm_overlap(read, best_sa_entry) if sa_chrom == p_chrom else None
 
             pos_lists[p_chrom].append(p_pos)
             pos_lists[sa_chrom].append(sa_pos)
             raw_pairs.append((
                 p_chrom,  p_pos,  p_clip_len,  p_mapq,
                 sa_chrom, sa_pos, sa_clip_len, sa_mapq,
+                arm_overlap,
             ))
 
         if _tqdm is not None:
@@ -893,11 +1041,11 @@ def find_major_clip_pairs(
 
     pair_support   = Counter()
     pair_clip_lens = defaultdict(lambda: {
-        "left": [], "right": [], "mapq_left": [], "mapq_right": []
+        "left": [], "right": [], "mapq_left": [], "mapq_right": [], "overlap": []
     })
 
     for (p_chrom, p_pos, p_clip_len, p_mapq,
-         sa_chrom, sa_pos, sa_clip_len, sa_mapq) in raw_pairs:
+         sa_chrom, sa_pos, sa_clip_len, sa_mapq, arm_overlap) in raw_pairs:
 
         if p_chrom != sa_chrom:
             continue
@@ -922,6 +1070,8 @@ def find_major_clip_pairs(
         else:
             d["left"].append(sa_clip_len);  d["mapq_left"].append(sa_mapq)
             d["right"].append(p_clip_len);  d["mapq_right"].append(p_mapq)
+        if arm_overlap is not None:
+            d["overlap"].append(arm_overlap)
 
     print(f"          {len(pair_support):,} unique pair(s) tallied before filters.", flush=True)
 
@@ -944,6 +1094,9 @@ def find_major_clip_pairs(
             "mean_clip_len_right": round(sum(d["right"]) / len(d["right"]), 1) if d["right"] else 0,
             "mapq_left":           round(sum(d["mapq_left"])  / len(d["mapq_left"]),  1) if d["mapq_left"]  else 0,
             "mapq_right":          round(sum(d["mapq_right"]) / len(d["mapq_right"]), 1) if d["mapq_right"] else 0,
+            # Median query overlap between the two arms; the deletion this pair
+            # implies is (pos_right - pos_left) + arm_overlap bp long.
+            "arm_overlap":         int(median(d["overlap"])) if d["overlap"] else None,
         })
 
     df = (
@@ -951,6 +1104,46 @@ def find_major_clip_pairs(
         .sort_values("support", ascending=False)
         .reset_index(drop=True)
     )
+
+    # Add in-CIGAR deletion reads describing the same event as each split-read pair.
+    # Split arms overlap on the read across homologous flanks (e.g. Alu), so a
+    # pair (L, R) with arm overlap ov is the same deletion as any D of length
+    # R - L + ov starting in [L - ov, L].  Each D read goes to one pair only: the
+    # compatible pair with the most split reads.
+    df["split_support"] = df["support"]
+    df["del_support"]   = 0
+    if cigar_dels:
+        for c in cigar_dels:
+            cigar_dels[c].sort()
+        del_starts = {c: [d[0] for d in v] for c, v in cigar_dels.items()}
+        assigned = {}  # (chrom, del_idx) -> df index
+        for i, row in df.iterrows():  # df is sorted by split support, descending
+            dels = cigar_dels.get(row["chrom"])
+            ov = row["arm_overlap"]
+            if not dels or ov is None or pd.isna(ov):
+                continue
+            ov = int(ov)
+            exp_len = row["pos_right"] - row["pos_left"] + ov
+            if exp_len < min_del_len:
+                continue
+            len_tol = del_match_tol + 0.02 * exp_len
+            starts = del_starts[row["chrom"]]
+            lo = bisect.bisect_left(starts, row["pos_left"] - max(ov, 0) - del_match_tol)
+            hi = bisect.bisect_right(starts, row["pos_left"] + del_match_tol)
+            for j in range(lo, hi):
+                key_d = (row["chrom"], j)
+                if key_d in assigned:
+                    continue
+                d_start, d_end = dels[j]
+                if abs((d_end - d_start) - exp_len) <= len_tol:
+                    assigned[key_d] = i
+                    df.at[i, "del_support"] += 1
+        df["support"] = df["split_support"] + df["del_support"]
+        df = df.sort_values("support", ascending=False).reset_index(drop=True)
+        print(f"          in-CIGAR deletions >= {min_del_len} bp: "
+              f"{sum(len(v) for v in cigar_dels.values()):,} reads; "
+              f"{len(assigned):,} assigned to {int((df['del_support'] > 0).sum()):,} pair(s) "
+              f"(del_match_tol={del_match_tol})", flush=True)
 
     n_before = len(df)
     if min_support:
@@ -991,7 +1184,7 @@ def find_major_clip_pairs(
             keep_mask.append(passes)
             if not passes:
                 print(
-                    f"          [DROP] {row['chrom']}:{row['pos_left']:,}–{row['pos_right']:,} "
+                    f"          [DROP] {row['chrom']}:{row['pos_left'] + 1:,}–{row['pos_right']:,} "
                     f"support={row['support']} min_depth={min_depth} "
                     f"required>={effective_min:.1f}",
                     flush=True,
@@ -1005,7 +1198,7 @@ def find_major_clip_pairs(
         os.makedirs(save_dir, exist_ok=True)
         bam_name = os.path.splitext(os.path.basename(bam_path))[0]
         out = os.path.join(save_dir, f"major_clip_pairs_{bam_name}.csv")
-        df.to_csv(out, index=False)
+        _pairs_1b(df).to_csv(out, index=False)
         print(f"          Saved: {out}", flush=True)
 
     _stage(f"find_major_clip_pairs complete  |  {len(df)} pair(s) retained.")
@@ -1111,6 +1304,18 @@ def cluster_clip_pairs_by_reads(
             if c == chrom_k and lp in member_pos_set and rp in member_pos_set
         )
 
+        # Expected in-CIGAR deletion geometry from the top-support member pair
+        top = None
+        if "arm_overlap" in pairs_df.columns:
+            members_df = pairs_df[
+                (pairs_df["chrom"] == chrom_k)
+                & pairs_df["pos_left"].isin(member_pos_set)
+                & pairs_df["pos_right"].isin(member_pos_set)
+            ]
+            if not members_df.empty:
+                top = members_df.sort_values("split_support" if "split_support" in members_df else "support",
+                                             ascending=False).iloc[0]
+
         clusters.append({
             "chrom":          chrom_k,
             "refined_left":   refined_left,
@@ -1118,6 +1323,9 @@ def cluster_clip_pairs_by_reads(
             "pairs":          member_pairs,
             "reads":          set(),   # populated below if needed
             "support":        total_support,
+            "top_pair_left":  int(top["pos_left"]) if top is not None else None,
+            "top_pair_right": int(top["pos_right"]) if top is not None else None,
+            "arm_overlap":    (int(top["arm_overlap"]) if top is not None and pd.notna(top["arm_overlap"]) else None),
         })
 
     # Sort clusters by total support descending
@@ -1127,7 +1335,7 @@ def cluster_clip_pairs_by_reads(
     for i, cl in enumerate(clusters, 1):
         print(
             f"  {i:>3}. {cl['chrom']} "
-            f"{cl['refined_left']:,}–{cl['refined_right']:,} "
+            f"{cl['refined_left'] + 1:,}–{cl['refined_right']:,} "
             f"support={cl['support']} ({len(cl['pairs'])} pair(s))"
         )
     return clusters
@@ -1178,7 +1386,7 @@ def get_homozygous_variants(bam_path, chrom, win_start, win_end, min_af=0.95, mi
 def build_split_consensus(
     reads, refined_left, refined_right, flank, fasta, chrom, sv_type,
     bam_path, show_pileup=True, show_homozygous_variants=False,
-    pileup_save_dir=None, pair_label=""
+    pileup_save_dir=None, pair_label="", del_reads=None,
 ):
     """Build a reference-anchored consensus sequence for the left and right flanks of an SV breakpoint from a collection of split reads. For each flank, read columns are piled up over a *flank*-bp window, background homozygous variants are detected and masked, and a per-column majority-vote consensus is produced. Optionally renders and saves HTML / PNG pileup visualisations."""
     if chrom not in fasta.references:
@@ -1186,7 +1394,7 @@ def build_split_consensus(
         return None, None, None, None, refined_right, "", "", {}
 
     is_deletion = sv_type == "deletion"
-    right_bp = refined_right - 1
+    right_bp = refined_right
 
     if is_deletion:
         ref_left  = _safe_fetch(fasta, chrom, refined_left - flank, refined_left)
@@ -1353,7 +1561,7 @@ def build_split_consensus(
             fields = sa_entry.split(",")
             if len(fields) < 4 or fields[0] != read.reference_name:
                 continue
-            sa_pos = int(fields[1])
+            sa_pos = int(fields[1]) - 1  # SAM SA POS is 1-based
             sa_strand = fields[2] if len(fields) > 2 else '+'
             sa_cigar = fields[3]
             ops = re.findall(r'(\d+)([MIDNSHP=X])', sa_cigar)
@@ -1525,6 +1733,56 @@ def build_split_consensus(
                         right_seqs.append((label, _columns_to_padded_seq(cd, flank)))
                         break
 
+    # In-CIGAR deletion reads (deletions only).  Each is projected as a virtual split
+    # read: on the left, query bases after the D are aligned onto the left reference
+    # from del_start; on the right, query bases before the D are aligned onto the
+    # right reference ending at del_end.  This mirrors how split aligners extend each
+    # arm into flank homology, so the columns line up with the SA-read columns.  The
+    # projection is aligned (not copied base-for-base) because homologous flanks can
+    # differ by indels.
+    if is_deletion and del_reads:
+        n_del_left = n_del_right = 0
+        for read, d_start, d_end, q_d in del_reads:
+            seq = read.query_sequence
+            if seq is None:
+                continue
+            seq = seq.upper()
+            label = f"{read.query_name} CIGAR-D:{d_start}-{d_end}"
+
+            cd = _cigar_walk_to_columns(read, left_win_start, left_win_end)
+            for col in [c for c in cd if c + left_win_start >= d_start]:
+                del cd[col]
+            if d_start < left_win_end:
+                ref_seg = _safe_fetch(fasta, chrom, d_start, left_win_end)
+                slack = max(10, len(ref_seg) // 20)
+                proj = _anchored_projection(seq[q_d:q_d + len(ref_seg) + slack], ref_seg)
+                for k, base in enumerate(proj):
+                    rp = d_start + k
+                    if left_win_start <= rp < left_win_end:
+                        cd[rp - left_win_start] = base
+            if cd:
+                left_cols.append(cd)
+                left_seqs.append((label, _columns_to_padded_seq(cd, flank)))
+                n_del_left += 1
+
+            cd = _cigar_walk_to_columns(read, right_win_start, right_win_end)
+            for col in [c for c in cd if c + right_win_start < d_end]:
+                del cd[col]
+            if d_end > right_win_start:
+                ref_seg = _safe_fetch(fasta, chrom, right_win_start, d_end)
+                slack = max(10, len(ref_seg) // 20)
+                q_seg = seq[max(0, q_d - len(ref_seg) - slack):q_d]
+                proj = _anchored_projection(q_seg[::-1], ref_seg[::-1])[::-1]
+                for k, base in enumerate(proj):
+                    rp = right_win_start + k
+                    if rp < right_win_end:
+                        cd[rp - right_win_start] = base
+            if cd:
+                right_cols.append(cd)
+                right_seqs.append((label, _columns_to_padded_seq(cd, flank)))
+                n_del_right += 1
+        print(f"In-CIGAR deletion reads added: left={n_del_left} right={n_del_right}")
+
     if not left_cols:
         print("Warning: no reads found spanning refined_left.")
     if not right_cols:
@@ -1564,8 +1822,18 @@ def build_split_consensus(
     if pileup_save_dir:
         os.makedirs(pileup_save_dir, exist_ok=True)
         _lbl = f"_{pair_label}" if pair_label else ""
-        _save_pileup_png("Left breakpoint pileup",  left_seqs,  left_consensus,  ref_left,  flank, after_bp=(not is_deletion), save_path=os.path.join(pileup_save_dir, f"pileup_left{_lbl}.png"))
-        _save_pileup_png("Right breakpoint pileup", right_seqs, right_consensus, ref_right, flank, after_bp=is_deletion,       save_path=os.path.join(pileup_save_dir, f"pileup_right{_lbl}.png"))
+        for _side, _seqs, _cons, _ref, _after in (
+            ("left",  left_seqs,  left_consensus,  ref_left,  not is_deletion),
+            ("right", right_seqs, right_consensus, ref_right, is_deletion),
+        ):
+            # A plotting failure must not abort the cluster (or the whole batch).
+            try:
+                _save_pileup_png(f"{_side.capitalize()} breakpoint pileup", _seqs, _cons, _ref, flank,
+                                 after_bp=_after, save_path=os.path.join(pileup_save_dir, f"pileup_{_side}{_lbl}.png"))
+            except Exception as e:
+                import matplotlib.pyplot as plt
+                plt.close("all")
+                print(f"  [WARN] {_side} pileup PNG failed for {pair_label or 'pair'}: {type(e).__name__}: {e}", flush=True)
 
     return (left_consensus, right_consensus, left_variant_mask, right_variant_mask, right_bp, ref_left, ref_right)
 
@@ -1661,15 +1929,24 @@ def _print_pileup(title, labeled_seqs, consensus, ref_anchor, flank, after_bp, m
     display(HTML(html))
 
 
-def _save_pileup_png(title, labeled_seqs, consensus, ref_anchor, flank, after_bp, save_path, max_reads=100):
-    """Render a breakpoint pileup as a PNG file using matplotlib. Mismatching bases are colour-coded per nucleotide; the consensus is shown at the bottom."""
+def _save_pileup_png(title, labeled_seqs, consensus, ref_anchor, flank, after_bp, save_path, max_reads=100, max_plot_cols=300):
+    """Render a breakpoint pileup as a PNG file using matplotlib. Mismatching bases are colour-coded per nucleotide; the consensus is shown at the bottom.
+
+    Only the max_plot_cols columns nearest the junction are drawn (the junction is
+    at column 0 when after_bp, else at column flank-1), so large auto-estimated
+    flanks don't exceed matplotlib's 2^16-pixel image limit.  Analysis is unaffected.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     BASE_COLOR = {"A": "#27ae60", "C": "#2980b9", "G": "#f39c12", "T": "#c0392b", "-": "#7f8c8d"}
-    width = flank
+    width  = min(flank, max_plot_cols)
+    offset = 0 if after_bp else flank - width
+    ref_anchor = ref_anchor[offset:offset + width]
+    consensus  = consensus[offset:offset + width]
+    flank  = width
     LABEL_WIDTH = 38
-    seqs_up = [(label, s.upper()[:width]) for label, s in labeled_seqs if s is not None]
+    seqs_up = [(label, s.upper()[offset:offset + width]) for label, s in labeled_seqs if s is not None]
     n_reads = min(len(seqs_up), max_reads)
     n_rows  = n_reads + 6
     row_h   = 0.18
@@ -1697,9 +1974,9 @@ def _save_pileup_png(title, labeled_seqs, consensus, ref_anchor, flank, after_bp
     y = next_y()
     ax.text(0, y, "ref".ljust(LABEL_WIDTH) + " " + ref_anchor[:width], **FONT, va="center")
     y = next_y()
-    ax.text(0, y, " " * LABEL_WIDTH + " " + "".join(str((i // 10) % 10) for i in range(width)), **FONT, va="center", color="#888888")
+    ax.text(0, y, " " * LABEL_WIDTH + " " + "".join(str((i // 10) % 10) for i in range(offset, offset + width)), **FONT, va="center", color="#888888")
     y = next_y()
-    ax.text(0, y, " " * LABEL_WIDTH + " " + "".join(str(i % 10) for i in range(width)), **FONT, va="center", color="#888888")
+    ax.text(0, y, " " * LABEL_WIDTH + " " + "".join(str(i % 10) for i in range(offset, offset + width)), **FONT, va="center", color="#888888")
     y = next_y()
     ax.text(0, y, " " * LABEL_WIDTH + " " + "─" * width, **FONT, va="center", color="#cccccc")
     for label, s in seqs_up[:max_reads]:
@@ -1727,7 +2004,7 @@ def _save_pileup_png(title, labeled_seqs, consensus, ref_anchor, flank, after_bp
 # 7. MMEJ microhomology detection  (identical to sv_analysis.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_mmej_microhomology(
+def find_microhomology(
     left_consensus, left_variant_mask,
     right_consensus, right_variant_mask,
     ref_left, ref_right,
@@ -1906,8 +2183,8 @@ def find_mmej_microhomology(
 
     best_k = best_overlap
     print(f"\n--- Best matching block (len={best_k}) ---")
-    print(f"  Left  [{best_l_start}:{best_l_end}]  genomic {left_win_start + left_orig_idx[best_l_start]}–{left_win_start + left_orig_idx[best_l_end - 1]}")
-    print(f"  Right [{best_r_start}:{best_r_end}]  genomic {right_win_start + right_orig_idx[best_r_start]}–{right_win_start + right_orig_idx[best_r_end - 1]}")
+    print(f"  Left  [{best_l_start}:{best_l_end}]  genomic {left_win_start + left_orig_idx[best_l_start] + 1}–{left_win_start + left_orig_idx[best_l_end - 1] + 1}")
+    print(f"  Right [{best_r_start}:{best_r_end}]  genomic {right_win_start + right_orig_idx[best_r_start] + 1}–{right_win_start + right_orig_idx[best_r_end - 1] + 1}")
 
     left_variant_mask_aln  = list(left_variant_mask_aln)
     right_variant_mask_aln = list(right_variant_mask_aln)
@@ -2100,8 +2377,8 @@ def find_mmej_microhomology(
 
         print(f"Edge MH detected: {edge_mh_len} bp (mismatches={edge_mismatches}, mode={edge_mode})  "
               f"left={mh_seq_left!r}  right={mh_seq_right!r}")
-        print(f"  → Left MH genomic:  {left_mh_genomic_start}–{left_mh_genomic_end}")
-        print(f"  → Right MH genomic: {right_mh_genomic_start}–{right_mh_genomic_end}")
+        print(f"  → Left MH genomic:  {left_mh_genomic_start + 1}–{left_mh_genomic_end + 1}")
+        print(f"  → Right MH genomic: {right_mh_genomic_start + 1}–{right_mh_genomic_end + 1}")
         return (edge_mh_len, mh_seq_left, mh_seq_right, edge_mismatches,
                 left_mh_genomic_start, left_mh_genomic_end,
                 right_mh_genomic_start, right_mh_genomic_end)
@@ -2146,8 +2423,8 @@ def find_mmej_microhomology(
     right_mh_genomic_start = right_win_start + right_orig_idx[best_r_start + mh_block_start]
     right_mh_genomic_end   = right_win_start + right_orig_idx[best_r_start + mh_block_end]
     print(f"\n → MH block indices: [{mh_block_start} – {mh_block_end}]  ({mh_len} bp, mismatches={n_mismatches})")
-    print(f" → Left MH genomic:  {left_mh_genomic_start} – {left_mh_genomic_end}")
-    print(f" → Right MH genomic: {right_mh_genomic_start} – {right_mh_genomic_end}")
+    print(f" → Left MH genomic:  {left_mh_genomic_start + 1} – {left_mh_genomic_end + 1}")
+    print(f" → Right MH genomic: {right_mh_genomic_start + 1} – {right_mh_genomic_end + 1}")
     print(f" → Left  MH seq: {mh_seq_left!r}")
     print(f" → Right MH seq: {mh_seq_right!r}")
     return (mh_len, mh_seq_left, mh_seq_right, n_mismatches,
@@ -2346,6 +2623,7 @@ def analyze_sv_cluster(
     bam_path, ref_path, cluster,
     flank=None, min_mh=2, show_pileup=False, min_mapq=60,
     pair_label="", save_dir=".", show_homozygous_variants=False,
+    min_del_len=50, del_match_tol=20,
 ):
     """Run the full MH pipeline for one merged soft-clip cluster.
 
@@ -2386,39 +2664,75 @@ def analyze_sv_cluster(
               f"(len={contig_len}) — skipping.")
         return None
 
-    # SV type detection
-    tol = max(50, padding // 10)
+    # SV type detection: at the left breakpoint a deletion's split reads end in a
+    # right clip, a duplication's start with a left clip.  Use a tight window and
+    # ignore short clips -- read-end clips (e.g. PacBio's ~5S tails) a few kb away
+    # would otherwise be counted when the window scales with the SV span.
+    tol = 50
+    min_type_clip = 50
     left_clips_at_left_bp, right_clips_at_left_bp = 0, 0
     REF_OPS_SA = {"M", "D", "N", "=", "X"}
     for read in reads:
         if read.is_unmapped or not read.cigartuples:
             continue
         cigars = read.cigartuples
-        if cigars[0][0] in CLIP_OPS and abs(read.reference_start - refined_left) < tol:
+        if (cigars[0][0] in CLIP_OPS and cigars[0][1] >= min_type_clip
+                and abs(read.reference_start - refined_left) < tol):
             left_clips_at_left_bp  += 1
-        if cigars[-1][0] in CLIP_OPS and abs(read.reference_end - refined_left) < tol:
+        if (cigars[-1][0] in CLIP_OPS and cigars[-1][1] >= min_type_clip
+                and abs(read.reference_end - refined_left) < tol):
             right_clips_at_left_bp += 1
         if read.has_tag("SA"):
             for sa_entry in read.get_tag("SA").rstrip(";").split(";"):
                 fields = sa_entry.split(",")
                 if len(fields) < 4 or fields[0] != chrom:
                     continue
-                sa_pos = int(fields[1])
+                sa_pos = int(fields[1]) - 1  # SAM SA POS is 1-based
                 sa_cigar = fields[3]
                 ops = re.findall(r'(\d+)([MIDNSHP=X])', sa_cigar)
                 if not ops:
                     continue
                 sa_ref_len = sum(int(l) for l, op in ops if op in REF_OPS_SA)
                 sa_end = sa_pos + sa_ref_len
-                if ops[0][1] in {"S", "H"} and abs(sa_pos - refined_left) < tol:
+                if (ops[0][1] in {"S", "H"} and int(ops[0][0]) >= min_type_clip
+                        and abs(sa_pos - refined_left) < tol):
                     left_clips_at_left_bp  += 1
-                if ops[-1][1] in {"S", "H"} and abs(sa_end - refined_left) < tol:
+                if (ops[-1][1] in {"S", "H"} and int(ops[-1][0]) >= min_type_clip
+                        and abs(sa_end - refined_left) < tol):
                     right_clips_at_left_bp += 1
 
+    print(f"[{pair_label}] sv_type vote at left bp: left-clipped={left_clips_at_left_bp} "
+          f"right-clipped={right_clips_at_left_bp}")
     sv_type = "deletion" if right_clips_at_left_bp >= left_clips_at_left_bp else "duplication"
-    print(f"[{pair_label}] sv_type={sv_type}  {chrom}:{refined_left}–{refined_right}")
-    print(f"[{pair_label}] merged pairs: {cluster['pairs']}")
-    print(f"[{pair_label}] envelope: {env_left}–{env_right}  widest span used for consensus")
+    print(f"[{pair_label}] sv_type={sv_type}  {chrom}:{refined_left + 1}–{refined_right}")
+    print(f"[{pair_label}] merged pairs: {[(c, l + 1, r) for c, l, r in cluster['pairs']]}")
+    print(f"[{pair_label}] envelope: {env_left + 1}–{env_right}  widest span used for consensus")
+
+    # In-CIGAR deletion reads describing the same event, matched with the same rule
+    # as Stage D: length R - L + arm_overlap, start within [L - arm_overlap, L].
+    del_reads = []
+    ov = cluster.get("arm_overlap")
+    if sv_type == "deletion" and min_del_len and ov is not None:
+        pair_l = cluster.get("top_pair_left") or refined_left
+        pair_r = cluster.get("top_pair_right") or refined_right
+        exp_len = pair_r - pair_l + ov
+        len_tol = del_match_tol + 0.02 * exp_len
+        start_lo = pair_l - max(ov, 0) - del_match_tol
+        start_hi = pair_l + del_match_tol
+        split_names = {r.query_name for r in reads}
+        with pysam.AlignmentFile(bam_path, "rb") as sf:
+            for read in sf.fetch(chrom, max(0, start_lo), start_hi + 1):
+                if (read.is_unmapped or read.is_secondary or read.is_supplementary
+                        or read.mapping_quality < min_mapq or read.query_name in split_names):
+                    continue
+                hits = [
+                    d for d in _large_deletions(read, min_del_len)
+                    if start_lo <= d[0] <= start_hi and abs((d[1] - d[0]) - exp_len) <= len_tol
+                ]
+                if hits:
+                    del_reads.append((read, *min(hits, key=lambda d: abs((d[1] - d[0]) - exp_len))))
+        print(f"[{pair_label}] in-CIGAR deletion reads matched: {len(del_reads)} "
+              f"(expected len={exp_len}, arm_overlap={ov})")
 
     fasta = pysam.FastaFile(ref_path)
     consensus_result = build_split_consensus(
@@ -2428,6 +2742,7 @@ def analyze_sv_cluster(
         show_homozygous_variants=show_homozygous_variants,
         pileup_save_dir=save_dir,
         pair_label=pair_label,
+        del_reads=del_reads,
     )
 
     if consensus_result[0] is None:
@@ -2436,7 +2751,7 @@ def analyze_sv_cluster(
 
     left_consensus, right_consensus, left_var_mask, right_var_mask, right_bp, ref_left, ref_right = consensus_result
 
-    (mh_len, mh_seq_left, mh_seq_right, mh_mismatches, left_mh_start, left_mh_end, right_mh_start, right_mh_end) = find_mmej_microhomology(
+    (mh_len, mh_seq_left, mh_seq_right, mh_mismatches, left_mh_start, left_mh_end, right_mh_start, right_mh_end) = find_microhomology(
         left_consensus, left_var_mask,
         right_consensus, right_var_mask,
         ref_left, ref_right,
@@ -2457,9 +2772,9 @@ def analyze_sv_cluster(
         plot_microhomology(
             mh_seq_left=mh_seq_left,
             mh_seq_right=mh_seq_right,
-            left_mh_genomic_start=left_mh_start,
-            right_mh_genomic_start=right_mh_start,
-            right_mh_genomic_end=right_mh_end,
+            left_mh_genomic_start=_pos_1b(left_mh_start),
+            right_mh_genomic_start=_pos_1b(right_mh_start),
+            right_mh_genomic_end=_pos_1b(right_mh_end),
             left_junc_left_mh=left_junc_left_mh,
             left_junc_right_mh=left_junc_right_mh,
             right_junc_left_mh=right_junc_left_mh,
@@ -2474,20 +2789,23 @@ def analyze_sv_cluster(
         "pair_label":             pair_label,
         "chrom":                  chrom,
         "sv_type":                sv_type,
-        "refined_left":           refined_left,
-        "refined_right":          right_bp,
-        "refined_left_envelope":  env_left,
-        "refined_right_envelope": env_right,
+        # 1-based (see "Coordinate reporting" at the top of the module)
+        "refined_left":           _seg_1b(refined_left, right_bp)[0],
+        "refined_right":          _seg_1b(refined_left, right_bp)[1],
+        "refined_left_envelope":  _seg_1b(env_left, env_right)[0],
+        "refined_right_envelope": _seg_1b(env_left, env_right)[1],
         "n_pairs_merged":         len(cluster["pairs"]),
-        "left_mh_genomic_start":  left_mh_start,
-        "left_mh_genomic_end":    left_mh_end,
-        "right_mh_genomic_start": right_mh_start,
-        "right_mh_genomic_end":   right_mh_end,
+        "left_mh_genomic_start":  _pos_1b(left_mh_start),
+        "left_mh_genomic_end":    _pos_1b(left_mh_end),
+        "right_mh_genomic_start": _pos_1b(right_mh_start),
+        "right_mh_genomic_end":   _pos_1b(right_mh_end),
         "microhomology_length":         mh_len,
         "microhomology_sequence_left":  mh_seq_left,
         "microhomology_sequence_right": mh_seq_right,
         "microhomology_mismatches":     mh_mismatches,
-        "supporting_reads":             len(reads),
+        "supporting_reads":             len(reads) + len(del_reads),
+        "supporting_split_reads":       len(reads),
+        "supporting_del_reads":         len(del_reads),
     }
 
 
@@ -2514,9 +2832,14 @@ def batch_microhomology_search(
     # ── sc_adjustment version ─────────────────────────────────────────────
     sa_share_threshold=0.50,    # kept for legacy; not used by fast path
     bridge_tol=200,             # SA-bridge search tolerance (bp)
+    # ── in-CIGAR deletion reads ───────────────────────────────────────────
+    min_del_len=50,             # min CIGAR D (bp) counted as a deletion read; 0 disables
+    del_match_tol=20,           # bp slack when matching a CIGAR D to a split pair
     # ── contig filtering ──────────────────────────────────────────────────
     edge_buffer=None,           # min bp from either contig end; None -> flank (or 600)
     allowed_chroms=None,        # set of contigs to keep; None -> chr1-22, X, Y
+    # ── extension hook ────────────────────────────────────────────────────
+    per_cluster_hook=None,      # optional callable, see docstring; None -> MH only
 ):
     """
     Batch MMEJ microhomology search with soft-clip pair clustering.
@@ -2529,6 +2852,15 @@ def batch_microhomology_search(
     E        cluster_clip_pairs_by_reads - read-centric Union-Find, no
                                            extra BAM fetch.
     F        analyze_sv_cluster (x N)  - consensus + MH search per cluster.
+
+    per_cluster_hook
+    ----------------
+    If given, called once per cluster right after analyze_sv_cluster as
+        per_cluster_hook(index, cluster, pair_label, mh_row) -> dict | None
+    (mh_row is None when analyze_sv_cluster returned nothing).  A returned
+    dict is merged into mh_row as extra columns.  Used by
+    sv_analysis_sc_adjustment_arc.py to draw an arc diagram per cluster;
+    it does not affect breakpoint or MH logic.
     """
     import os, sys, time
 
@@ -2582,10 +2914,12 @@ def batch_microhomology_search(
             min_mapq         = min_mapq,
             max_dist         = max_dist,
             save_dir         = None,
+            min_del_len      = min_del_len,
+            del_match_tol    = del_match_tol,
         )
         if not pairs_df.empty:
             out = os.path.join(save_dir, f"major_clip_pairs_{bam_name}.csv")
-            pairs_df.to_csv(out, index=False)
+            _pairs_1b(pairs_df).to_csv(out, index=False)
             print(f"          Saved: {out}", flush=True)
         print(f"\n  Stages A-D elapsed: {time.time()-t0:.1f}s", flush=True)
 
@@ -2619,7 +2953,7 @@ def batch_microhomology_search(
         for i, cl in enumerate(clusters, 1):
             print(
                 f"    {i:>3}. {cl['chrom']}  "
-                f"{cl['refined_left']:,} – {cl['refined_right']:,}  "
+                f"{cl['refined_left'] + 1:,} – {cl['refined_right']:,}  "
                 f"(span {cl['refined_right']-cl['refined_left']:,} bp  "
                 f"support={cl['support']}  {len(cl['pairs'])} pair(s))",
                 flush=True,
@@ -2631,12 +2965,12 @@ def batch_microhomology_search(
         t_stage_f = time.time()
 
         for i, cluster in enumerate(clusters, 1):
-            label = f"{bam_name}_c{i:02d}_{cluster['chrom']}_{cluster['refined_left']}"
+            label = f"{bam_name}_c{i:02d}_{cluster['chrom']}_{cluster['refined_left'] + 1}"
             t0 = time.time()
             print(f"\n  [{time.strftime('%H:%M:%S')}]  Cluster {i}/{len(clusters)}: "
-                  f"{cluster['chrom']} {cluster['refined_left']:,} – {cluster['refined_right']:,}",
+                  f"{cluster['chrom']} {cluster['refined_left'] + 1:,} – {cluster['refined_right']:,}",
                   flush=True)
-            print(f"    pairs   : {cluster['pairs']}", flush=True)
+            print(f"    pairs   : {[(c, l + 1, r) for c, l, r in cluster['pairs']]}", flush=True)
             print(f"    support : {cluster['support']}", flush=True)
             row = analyze_sv_cluster(
                 bam_path, ref_path, cluster,
@@ -2647,11 +2981,17 @@ def batch_microhomology_search(
                 pair_label               = label,
                 save_dir                 = save_dir,
                 show_homozygous_variants = show_homozygous_variants,
+                min_del_len              = min_del_len,
+                del_match_tol            = del_match_tol,
             )
+            if per_cluster_hook is not None:
+                extra = per_cluster_hook(i, cluster, label, row)
+                if row and extra:
+                    row.update(extra)
             print(f"    elapsed : {time.time()-t0:.1f}s", flush=True)
             if row:
                 results.append(row)
-            break ### temporary to let top 1 MH cluster through only
+            # break ### temporary to let top 1 MH cluster through only
 
         print(f"\n  Stage F total elapsed: {time.time()-t_stage_f:.1f}s", flush=True)
 

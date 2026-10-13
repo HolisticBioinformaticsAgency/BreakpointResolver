@@ -31,3 +31,6 @@ __pycache__/
 *.fasta
 *.fna
 *.fai
+
+# Sample ID mapping (contains DNS IDs) - keep local only
+batch_scripts/ont_pacbio_batch_scripts/barcode_sample_ids.tsv
